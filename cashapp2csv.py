@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.14"
 # dependencies = [
-#   "pdfplumber>=0.11,<0.12",
+#   "pdfplumber==0.11.10",
 # ]
 # ///
 
@@ -25,7 +25,7 @@ import sys
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Iterable, Sequence, TextIO
+from typing import Iterable, Sequence, TextIO, TypedDict, cast
 
 import pdfplumber
 from pdfplumber.pdf import PDF
@@ -53,6 +53,14 @@ class Transaction:
 
     def as_row(self) -> list[str]:
         return [self.date, self.description, self.details, self.fee, self.amount]
+
+
+class ExtractedWord(TypedDict):
+    text: str
+    x0: float
+    x1: float
+    top: float
+    bottom: float
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -86,9 +94,9 @@ def detect_year(pdf: PDF, override: int | None) -> int:
     raise ValueError("Could not detect statement year; pass --year YYYY")
 
 
-def find_header(words: list[dict]) -> tuple[float, Columns] | None:
+def find_header(words: list[ExtractedWord]) -> tuple[float, Columns] | None:
     """Return header baseline and x-starts for the five columns."""
-    by_text: dict[str, list[dict]] = {}
+    by_text: dict[str, list[ExtractedWord]] = {}
     for word in words:
         by_text.setdefault(word["text"].strip().lower(), []).append(word)
 
@@ -98,46 +106,46 @@ def find_header(words: list[dict]) -> tuple[float, Columns] | None:
 
     # Find a set of header words sharing roughly the same vertical position.
     for date_word in by_text["date"]:
-        y = float(date_word["top"])
-        selected: dict[str, dict] = {"date": date_word}
+        y = date_word["top"]
+        selected: dict[str, ExtractedWord] = {"date": date_word}
         for name in required[1:]:
-            candidates = [w for w in by_text[name] if abs(float(w["top"]) - y) <= 4]
+            candidates = [w for w in by_text[name] if abs(w["top"] - y) <= 4]
             if not candidates:
                 break
-            selected[name] = min(candidates, key=lambda w: abs(float(w["top"]) - y))
+            selected[name] = min(candidates, key=lambda w: abs(w["top"] - y))
         if len(selected) == len(required):
             # Use the midpoint of the whitespace between adjacent headers as
             # each column boundary. This includes detached signs (for example,
             # the "+" printed just to the left of an amount).
             columns = Columns(
-                description=(float(selected["date"]["x1"]) + float(selected["description"]["x0"])) / 2,
-                details=(float(selected["description"]["x1"]) + float(selected["details"]["x0"])) / 2,
-                fee=(float(selected["details"]["x1"]) + float(selected["fee"]["x0"])) / 2,
-                amount=(float(selected["fee"]["x1"]) + float(selected["amount"]["x0"])) / 2,
+                description=(selected["date"]["x1"] + selected["description"]["x0"]) / 2,
+                details=(selected["description"]["x1"] + selected["details"]["x0"]) / 2,
+                fee=(selected["details"]["x1"] + selected["fee"]["x0"]) / 2,
+                amount=(selected["fee"]["x1"] + selected["amount"]["x0"]) / 2,
             )
-            return max(float(w["bottom"]) for w in selected.values()), columns
+            return max(w["bottom"] for w in selected.values()), columns
     return None
 
 
-def group_words_into_lines(words: Iterable[dict], tolerance: float = 3.0) -> list[list[dict]]:
-    lines: list[list[dict]] = []
-    for word in sorted(words, key=lambda w: (float(w["top"]), float(w["x0"]))):
-        top = float(word["top"])
+def group_words_into_lines(words: Iterable[ExtractedWord], tolerance: float = 3.0) -> list[list[ExtractedWord]]:
+    lines: list[list[ExtractedWord]] = []
+    for word in sorted(words, key=lambda w: (w["top"], w["x0"])):
+        top = word["top"]
         for line in lines:
-            if abs(float(line[0]["top"]) - top) <= tolerance:
+            if abs(line[0]["top"] - top) <= tolerance:
                 line.append(word)
                 break
         else:
             lines.append([word])
     for line in lines:
-        line.sort(key=lambda w: float(w["x0"]))
+        line.sort(key=lambda w: w["x0"])
     return lines
 
 
-def text_in_range(line: list[dict], left: float, right: float | None) -> str:
-    selected = []
+def text_in_range(line: list[ExtractedWord], left: float, right: float | None) -> str:
+    selected: list[str] = []
     for word in line:
-        center = (float(word["x0"]) + float(word["x1"])) / 2
+        center = (word["x0"] + word["x1"]) / 2
         if center >= left and (right is None or center < right):
             selected.append(word["text"])
     return normalize_spaces(" ".join(selected))
@@ -165,17 +173,62 @@ def parse_date(raw: str, year: int) -> str:
     return datetime.strptime(f"{year} {month} {day}", "%Y %b %d").date().isoformat()
 
 
+def parse_extracted_words(raw_words: object, page_number: int) -> list[ExtractedWord]:
+    if not isinstance(raw_words, list):
+        raise ValueError(f"extract_words returned a non-list on page {page_number}")
+
+    raw_list = cast(list[object], raw_words)
+    words: list[ExtractedWord] = []
+    for index, raw_word in enumerate(raw_list):
+        if not isinstance(raw_word, dict):
+            raise ValueError(f"extract_words item {index} on page {page_number} is not a dict")
+
+        word = cast(dict[str, object], raw_word)
+
+        text = word.get("text")
+        x0 = word.get("x0")
+        x1 = word.get("x1")
+        top = word.get("top")
+        bottom = word.get("bottom")
+
+        if not isinstance(text, str):
+            raise ValueError(f"extract_words item {index} on page {page_number} has non-string text")
+        if not isinstance(x0, (int, float)):
+            raise ValueError(f"extract_words item {index} on page {page_number} has non-numeric x0")
+        if not isinstance(x1, (int, float)):
+            raise ValueError(f"extract_words item {index} on page {page_number} has non-numeric x1")
+        if not isinstance(top, (int, float)):
+            raise ValueError(f"extract_words item {index} on page {page_number} has non-numeric top")
+        if not isinstance(bottom, (int, float)):
+            raise ValueError(f"extract_words item {index} on page {page_number} has non-numeric bottom")
+
+        words.append(
+            {
+                "text": text,
+                "x0": float(x0),
+                "x1": float(x1),
+                "top": float(top),
+                "bottom": float(bottom),
+            }
+        )
+
+    return words
+
+
 def extract_transactions(pdf_path: Path, year_override: int | None) -> list[Transaction]:
     transactions: list[Transaction] = []
     with pdfplumber.open(pdf_path) as pdf:
         year = detect_year(pdf, year_override)
         for page_number, page in enumerate(pdf.pages, start=1):
-            words = page.extract_words(use_text_flow=False, keep_blank_chars=False)
+            words = parse_extracted_words(
+                page.extract_words(use_text_flow=False, keep_blank_chars=False),
+                page_number,
+            )
             found = find_header(words)
             if found is None:
                 continue
             header_bottom, columns = found
-            body_words = [w for w in words if float(w["top"]) > header_bottom + 4]
+            body_words = [w for w in words if w["top"] > header_bottom + 4]
             for line in group_words_into_lines(body_words):
                 date_raw = text_in_range(line, 0, columns.description)
                 if not DATE_RE.match(date_raw):
